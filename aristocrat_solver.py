@@ -1,148 +1,151 @@
-#!/usr/bin/env python3
-import argparse, random, string, math, re, json, sys
-from collections import Counter
+import math
+import random
+import re
+from collections import Counter, defaultdict
 
-ETAOIN = "ETAOINSHRDLCUMWFGYPBVKJXQZ"
-ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+ALPH = 'abcdefghijklmnopqrstuvwxyz'
 
-COMMON_WORDS = set("""the be to of and a in that have I it for not on with he as you do at this but his by from they we say her she or an will my one all would there their what so up out if about who get which go me when make can like time no just him know take people into year your good some could them see other than then now look only come its over think also back after use two how our work first well way even new want because any these give day most us are is was were been had did does won t don re ve ll s m isn weren hasn aren""".split())
-BIGRAMS = ["TH", "HE", "IN", "ER", "AN", "RE", "ON", "AT", "EN", "ND", "TI", "ES", "OR", "TE", "OF", "ED", "IS", "IT", "AL", "AR", "ST", "TO", "NT", "NG", "SE", "HA", "AS", "OU", "IO", "LE", "IS", "VE"]
-TRIGRAMS = ["THE", "AND", "ING", "ENT", "ION", "HER", "FOR", "THA", "NTH", "INT", "ERE", "TIO", "TER", "EST", "ERS", "ATI", "HES", "VER", "ALL"]
+def normalize(text):
+    return re.sub(r'[^a-zA-Z\s]', ' ', text).lower()
 
-word_re = re.compile(r"\b[a-zA-Z]{2,}\b")
+# --- Build n-gram model from a corpus text (one-time) ---
+def build_ngram_model(corpus_text, n=4):
+    corpus = normalize(corpus_text).replace(' ', '')
+    counts = Counter(corpus[i:i+n] for i in range(len(corpus)-n+1))
+    total = sum(counts.values())
+    # Add small floor to avoid zero probs (Laplace smoothing)
+    floor = 0.01
+    logp = {gram: math.log((count + floor) / (total + floor * (26**n))) for gram, count in counts.items()}
+    default_logp = math.log(floor / (total + floor * (26**n)))
+    return logp, default_logp
 
-def letters_only(s):
-    return re.sub(r"[^A-Za-z]+", "", s).upper()
+# --- Wordlist-based scoring (optional external) ---
+def load_wordlist(path):
+    with open(path, 'r', encoding='utf8', errors='ignore') as f:
+        return set(w.strip().lower() for w in f if w.strip())
 
-def freq_seed_key(ciphertext):
-    text = letters_only(ciphertext)
-    if not text:
-        return dict(zip(ALPHABET, ALPHABET))
-    freqs = Counter(text)
-    cipher_order = "".join([p for p,_ in freqs.most_common()])
-    for ch in ALPHABET:
-        if ch not in cipher_order:
-            cipher_order += ch
-    mapping = {}
-    for i, c in enumerate(cipher_order):
-        mapping[c] = ETAOIN[i] if i < len(ETAOIN) else (set(ALPHABET) - set(ETAOIN))[i-len(ETAOIN)]
-    for c in ALPHABET:
-        mapping.setdefault(c, c)
-    return mapping
+def word_match_score(candidate_text, wordset):
+    words = re.findall(r"[a-z]+", candidate_text.lower())
+    if not words:
+        return 0.0
+    hits = sum(1 for w in words if w in wordset)
+    return hits / len(words)
 
-def invert_mapping(map_cp):
-    key = {c:map_cp.get(c, c) for c in ALPHABET}
-    return "".join(key[c] for c in ALPHABET)
+# ======== NEW: tiny built-in wordlist & boundary bigram bonus ========
+# High-yield common words; tiny and in-code (no files needed)
+MINI_WORDS = {
+    "the","and","that","for","you","with","have","this","not","but",
+    "his","her","was","are","from","they","said","one","all","there",
+    "be","to","of","in","it","is","as","on","by","an","or","at"
+}
 
-def apply_key(cipher, key):
+# Simple word-boundary bigrams (space-aware)
+BOUNDARY_BIS = [" th", "he ", " an", " a ", " in", "in ", " to", "to ", " of", "of "]
+
+def boundary_bigram_score(ptxt, w=0.25):
+    s = 0.0
+    lower = ptxt.lower()
+    for bb in BOUNDARY_BIS:
+        s += lower.count(bb)
+    return w * s
+# =====================================================================
+
+# --- Apply key to ciphertext ---
+def decrypt_with_key(ctext, key_map):
+    # key_map: dict mapping 'a'..'z' ciphertext -> plaintext
     out = []
-    for ch in cipher:
+    for ch in ctext:
         if ch.isalpha():
-            idx = ord(ch.upper()) - 65
-            plain = key[idx]
-            out.append(plain if ch.isupper() else plain.lower())
+            lower = ch.lower()
+            p = key_map[lower]
+            out.append(p.upper() if ch.isupper() else p)
         else:
             out.append(ch)
-    return "".join(out)
+    return ''.join(out)
 
-def score_text(text):
-    up = text.upper()
-    score = 0.0
-    for bg in BIGRAMS:
-        score += up.count(bg) * 1.5
-    for tg in TRIGRAMS:
-        score += up.count(tg) * 2.5
-    words = re.findall(word_re, text.lower())
-    hits = sum(1 for w in words if w in COMMON_WORDS)
-    score += hits * 1.2
-    score -= len(re.findall(r"Q(?!U)", up)) * 0.8
-    spaces = text.count(' ')
-    score += min(spaces, 50) * 0.05
-    return score
+# --- Score text using n-grams + word matches (+ new fallbacks) ---
+def score_candidate(ptxt, ngram_logp, default_logp, n=4, wordset=None, w_word=2.0):
+    # ngram score
+    s = 0.0
+    alpha = re.sub(r'[^a-z]', '', ptxt.lower())
+    for i in range(len(alpha)-n+1):
+        gram = alpha[i:i+n]
+        s += ngram_logp.get(gram, default_logp)
 
-def random_neighbor(key):
-    a, b = random.sample(range(26), 2)
-    lst = list(key)
-    lst[a], lst[b] = lst[b], lst[a]
-    return "".join(lst)
-
-def anneal(cipher, start_key, steps=8000, temp_start=3.0, temp_end=0.05):
-    def temp(t):
-        return temp_start * ((temp_end / temp_start) ** (t / max(1, steps-1)))
-    current_key = start_key
-    current_plain = apply_key(cipher, current_key)
-    current_score = score_text(current_plain)
-    best_key, best_score, best_plain = current_key, current_score, current_plain
-    trail = [current_score]
-
-    for t in range(steps):
-        cand_key = random_neighbor(current_key)
-        cand_plain = apply_key(cipher, cand_key)
-        cand_score = score_text(cand_plain)
-        d = cand_score - current_score
-        if d >= 0 or random.random() < math.exp(d / max(1e-6, temp(t))):
-            current_key, current_score, current_plain = cand_key, cand_score, cand_plain
-            if current_score > best_score:
-                best_key, best_score, best_plain = current_key, current_score, current_plain
-        trail.append(current_score)
-    return {"best_key": best_key, "best_score": best_score, "best_plain": best_plain, "trail": trail}
-
-def random_key():
-    lst = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
-    random.shuffle(lst)
-    return "".join(lst)
-
-def solve(cipher, steps=8000, restarts=25, seed=None):
-    if seed is not None:
-        random.seed(seed)
-    results = []
-    seed_map = freq_seed_key(cipher)
-    seed_key = invert_mapping(seed_map)
-    for r in range(restarts):
-        start_key = seed_key if r == 0 else random_key()
-        res = anneal(cipher, start_key, steps=steps)
-        res["restart"] = r
-        results.append(res)
-    best = max(results, key=lambda x: x["best_score"])
-    return best, results
-
-def pretty_key(key):
-    header = "CIPHER: " + " ".join("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
-    plain  = "PLAIN : " + " ".join(list(key))
-    return header + "\n" + plain
-
-def main():
-    import argparse
-    p = argparse.ArgumentParser(description="Aristocrat (monoalphabetic substitution) solver")
-    src = p.add_mutually_exclusive_group(required=True)
-    src.add_argument("--cipher", type=str, help="Ciphertext string")
-    src.add_argument("--file", type=str, help="Path to ciphertext file")
-    p.add_argument("--steps", type=int, default=8000, help="Annealing steps per restart")
-    p.add_argument("--restarts", type=int, default=25, help="Number of restarts")
-    p.add_argument("--seed", type=int, default=None, help="Random seed")
-    p.add_argument("--json-out", type=str, default=None, help="Write JSON with results")
-    args = p.parse_args()
-
-    if args.file:
-        with open(args.file, "r", encoding="utf-8") as f:
-            cipher = f.read()
+    # word score: use external wordset if available, else tiny built-in set
+    if wordset:
+        s += w_word * word_match_score(ptxt, wordset)
     else:
-        cipher = args.cipher
+        # add a small per-hit nudge using the tiny in-code list
+        hits = sum(1 for w in re.findall(r"[a-z]+", ptxt.lower()) if w in MINI_WORDS)
+        s += 1.0 * hits  # modest boost per recognized common word
 
-    best, allres = solve(cipher, steps=args.steps, restarts=args.restarts, seed=args.seed)
+    # boundary bigram bonus (gentle bias toward English-shaped spacing)
+    s += boundary_bigram_score(ptxt, w=0.25)
 
-    print("="*72)
-    print(" BEST SCORE:", round(best["best_score"], 2))
-    print("="*72)
-    print(pretty_key(best["best_key"]))
-    print("-"*72)
-    print("PLAINTEXT GUESS:\n")
-    print(best["best_plain"])
-    print("-"*72)
-    if args.json_out:
-        with open(args.json_out, "w", encoding="utf-8") as jf:
-            import json
-            json.dump(best, jf, indent=2)
+    return s
 
-if __name__ == "__main__":
-    main()
+# --- Random key operations ---
+def random_key():
+    letters = list(ALPH)
+    plain = letters[:]
+    random.shuffle(plain)
+    return dict(zip(letters, plain))
+
+def swap_two(key_map):
+    # return a new key map with two plaintext values swapped
+    k = key_map.copy()
+    a, b = random.sample(ALPH, 2)
+    k[a], k[b] = k[b], k[a]
+    return k
+
+# --- Hill-climbing with simulated annealing ---
+def optimize(ctext, ngram_logp, default_logp, wordset=None, iterations=2000, starting_key=None):
+    if starting_key is None:
+        key = random_key()
+    else:
+        key = starting_key.copy()
+    best_key, best_score = key, score_candidate(decrypt_with_key(ctext, key), ngram_logp, default_logp, wordset=wordset)
+    current_key, current_score = best_key.copy(), best_score
+    T0 = 1.0
+    for i in range(iterations):
+        T = T0 * (1 - i / iterations)  # linear cooling
+        cand_key = swap_two(current_key)
+        cand_text = decrypt_with_key(ctext, cand_key)
+        cand_score = score_candidate(cand_text, ngram_logp, default_logp, wordset=wordset)
+        delta = cand_score - current_score
+        if delta > 0 or math.exp(delta / max(1e-9, T)) > random.random():
+            current_key, current_score = cand_key, cand_score
+            if current_score > best_score:
+                best_key, best_score = current_key.copy(), current_score
+    return best_key, best_score
+
+# --- Example usage skeleton ---
+if __name__ == '__main__':
+    ciphertext = """YOUR CIPHERTEXT GOES HERE"""
+    # Option A: build ngram model from a local corpus (provide corpus.txt)
+    # with open('corpus.txt','r',encoding='utf8') as f: corpus = f.read()
+    # ngram_logp, default_logp = build_ngram_model(corpus, n=4)
+
+    # Option B: fallback approximate model
+    ngram_logp, default_logp = {}, math.log(1e-9)
+
+    # Load wordlist if available; otherwise we’ll use MINI_WORDS automatically
+    try:
+        wordset = load_wordlist('/usr/share/dict/words')
+    except Exception:
+        wordset = None
+
+    # Run many restarts
+    best_overall = None
+    best_score = -1e9
+    for r in range(50):
+        start = None  # could seed a frequency-based key instead
+        k, s = optimize(ciphertext, ngram_logp, default_logp, wordset=wordset, iterations=4000, starting_key=start)
+        if s > best_score:
+            best_score = s
+            best_overall = k
+            print(f"New best (r={r}) score={s:.2f}:")
+            print(decrypt_with_key(ciphertext, best_overall))
+    print("FINAL BEST:")
+    print(decrypt_with_key(ciphertext, best_overall))
