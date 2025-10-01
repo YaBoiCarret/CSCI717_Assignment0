@@ -166,9 +166,11 @@ def random_neighbor(key):
     lst[a], lst[b] = lst[b], lst[a]
     return "".join(lst)
 
-def anneal(cipher, start_key, steps=8000, temp_start=3.0, temp_end=0.05, boundary_on=True, bw=0.4, bs=0.3, be=0.3, debug=False, use_enriched=False, p3=0.2, pt=0.2):
+def anneal(cipher, start_key, steps=8000, temp_start=3.0, temp_end=0.05, boundary_on=True, bw=0.4, bs=0.3, be=0.3, debug=False, use_enriched=False, p3=0.2, pt=0.2,
+           adaptive_cooling=False, ac_low=0.05, ac_high=0.5, ac_adjust=1.15,
+           stagnant=600, reheat=2.0, max_reheats=3, adaptive_cooling=False, ac_low=0.05, ac_high=0.5, ac_adjust=1.15, stagnant=600, reheat=2.0, max_reheats=3):
     def temp(t):
-        return temp_start * ((temp_end / temp_start) ** (t / max(1, steps-1)))
+        return cur_temp_start * ((temp_end / cur_temp_start) ** (t / max(1, steps-1)))
     current_key = start_key
     current_plain = apply_key(cipher, current_key)
     current_score = score_text(current_plain, boundary_on, bw, bs, be)
@@ -180,8 +182,27 @@ def anneal(cipher, start_key, steps=8000, temp_start=3.0, temp_end=0.05, boundar
         d = cand_score - current_score
         if d >= 0 or random.random() < math.exp(d / max(1e-6, temp(t))):
             current_key, current_score, current_plain = cand_key, cand_score, cand_plain
+            accepts += 1
             if current_score > best_score:
                 best_key, best_score, best_plain = current_key, current_score, current_plain
+                last_improve_t = t
+        window += 1
+        # Adaptive cooling: every ~200 steps, adjust temp if acceptance rate too low/high
+        if adaptive_cooling and window >= 200:
+            rate = accepts / max(1, window)
+            if rate < ac_low:
+                # too cold: raise starting temp a bit
+                cur_temp_start *= ac_adjust
+            elif rate > ac_high:
+                # too hot: lower starting temp a bit (cool faster)
+                cur_temp_start /= ac_adjust
+            accepts = 0
+            window = 0
+        # Micro-reheat: if stagnant for a while, bump temperature (limited times)
+        if stagnant and (t - last_improve_t) >= stagnant and reheats_done < max_reheats:
+            cur_temp_start *= reheat
+            reheats_done += 1
+            last_improve_t = t  # reset stagnation timer
     return {"best_key": best_key, "best_score": best_score, "best_plain": best_plain}
 
 def random_key():
@@ -190,7 +211,9 @@ def random_key():
     random.shuffle(lst)
     return "".join(lst)
 
-def solve(cipher, steps=8000, restarts=25, seed=None, boundary_on=True, bw=0.4, bs=0.3, be=0.3, score_debug=False, use_enriched=False, p3=0.2, pt=0.2):
+def solve(cipher, steps=8000, restarts=25, seed=None, boundary_on=True, bw=0.4, bs=0.3, be=0.3, score_debug=False, use_enriched=False, p3=0.2, pt=0.2,
+         adaptive_cooling=False, ac_low=0.05, ac_high=0.5, ac_adjust=1.15,
+         stagnant=600, reheat=2.0, max_reheats=3, adaptive_cooling=False, ac_low=0.05, ac_high=0.5, ac_adjust=1.15, stagnant=600, reheat=2.0, max_reheats=3):
     if seed is not None:
         random.seed(seed)
     results = []
@@ -198,7 +221,9 @@ def solve(cipher, steps=8000, restarts=25, seed=None, boundary_on=True, bw=0.4, 
     seed_key = invert_mapping(seed_map)
     for r in range(restarts):
         start_key = seed_key if r == 0 else random_key()
-        res = anneal(cipher, start_key, steps=steps, boundary_on=boundary_on, bw=bw, bs=bs, be=be, debug=score_debug, use_enriched=use_enriched, p3=p3, pt=pt)
+        res = anneal(cipher, start_key, steps=steps, boundary_on=boundary_on, bw=bw, bs=bs, be=be, debug=score_debug, use_enriched=use_enriched, p3=p3, pt=pt,
+                        adaptive_cooling=adaptive_cooling, ac_low=ac_low, ac_high=ac_high, ac_adjust=ac_adjust,
+                        stagnant=stagnant, reheat=reheat, max_reheats=max_reheats)
         res["restart"] = r
         results.append(res)
     best = max(results, key=lambda x: x["best_score"])
@@ -216,6 +241,18 @@ def main():
     p.add_argument("--bs", type=float, default=0.3, help="Boundary start-bigram weight")
     p.add_argument("--be", type=float, default=0.3, help="Boundary end-bigram weight")
     p.add_argument("--score-debug", action="store_true", help="Print score breakdown for best plaintext")
+    # Enriched move set
+    p.add_argument("--use-enriched", action="store_true", help="Enable enriched move set (swap + 3-cycle + targeted reassign)")
+    p.add_argument("--p3", type=float, default=0.2, help="Probability of a 3-cycle move")
+    p.add_argument("--pt", type=float, default=0.2, help="Probability of a targeted reassign move")
+    # Adaptive cooling + micro-reheats
+    p.add_argument("--adaptive-cooling", action="store_true", help="Enable adaptive cooling adjustments based on acceptance rate")
+    p.add_argument("--ac-low", type=float, default=0.05, help="Acceptance rate lower bound (too cold)")
+    p.add_argument("--ac-high", type=float, default=0.50, help="Acceptance rate upper bound (too hot)")
+    p.add_argument("--ac-adjust", type=float, default=1.15, help="Multiplicative adjust to starting temperature")
+    p.add_argument("--stagnant", type=int, default=600, help="Steps without improvement before a micro-reheat")
+    p.add_argument("--reheat", type=float, default=2.0, help="Temperature multiplier on micro-reheat")
+    p.add_argument("--max-reheats", type=int, default=3, help="Maximum number of micro-reheats per restart")
     p.add_argument("--use-enriched", action="store_true", help="Use enriched move set (3-cycle + targeted reassign)")
     p.add_argument("--p3", type=float, default=0.2, help="Probability of 3-cycle move when enriched is on")
     p.add_argument("--pt", type=float, default=0.2, help="Probability of targeted reassign when enriched is on")
