@@ -48,10 +48,28 @@ def apply_key(cipher, key):
 def score_text(text):
     up = text.upper()
     score = 0.0
+    # classic n-gram bonuses
     for bg in BIGRAMS:
         score += up.count(bg) * 1.5
     for tg in TRIGRAMS:
         score += up.count(tg) * 2.5
+
+    # NEW: pattern-aware bonuses/penalties
+    # single-letter words
+    singles = re.findall(r'\\b[A-Z]\\b', up)
+    for ch in singles:
+        if ch in 'IA':
+            score += 3.0
+        elif ch in 'O':  # neutral
+            score += 0.0
+        else:
+            score -= 1.5
+    # contractions
+    score += len(re.findall(r"\\b\\w+N'T\\b", up)) * 2.0  # CAN'T, WON'T
+    score += len(re.findall(r"\\b\\w+'LL\\b", up)) * 1.5  # I'LL, WE'LL
+    score += len(re.findall(r"\\b\\w+'RE\\b", up)) * 1.5  # YOU'RE, THEY'RE
+
+    # base common-word hits & penalties
     words = re.findall(word_re, text.lower())
     hits = sum(1 for w in words if w in COMMON_WORDS)
     score += hits * 1.2
